@@ -1,24 +1,25 @@
-// kafueineto — keep a Mac awake and, in explicit aggressive mode, keep the
-// current GUI session from being auto-locked.
+// kafueineto — keep a Mac awake and, with an explicit flag, keep the current
+// GUI session from being auto-locked.
 //
-// Build (a current macOS SDK; runtime -a support also requires sysadminctl -screenLock; C++17 and Blocks are required):
+// Build (a current macOS SDK; runtime -L support also requires sysadminctl -screenLock; C++17 and Blocks are required):
 //   clang++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -fblocks \
 //     kafueineto.cpp -o kafueineto \
 //     -framework ApplicationServices -framework IOKit \
 //     -framework SystemConfiguration -framework CoreFoundation -lutil
 //
-// Modes (the idle-sleep veto and, with -d, periodic user activity come with
-// every mode):
-//   Default             Prevent idle system sleep with an IOKit assertion.
+// Methods (one flag each; the idle-sleep veto comes with every run):
+//   (base)              Prevent idle system sleep with an IOKit assertion.
 //   -d / --display      Also prevent idle display sleep and declare activity.
-//   -x / --max          Every layer that needs no privilege: -d, the strong
-//                       PreventSystemSleep assertion, input jiggle, and the
-//                       Accessibility permission request.
-//   -H / --hard-no-sleep  Root-only. Additionally set the system-wide
-//                       SleepDisabled gate (and hold the strong assertion).
-//   -a / --all          Root-only. -x and -H plus temporary Screen Lock/
-//                       screensaver policy overrides for the logged-in GUI
-//                       user.
+//   -s / --strong       Also hold the PreventSystemSleep assertion.
+//   -p / --presence     Reset the HID idle counters with a null HID event once
+//                       the user has been idle for --idle seconds.
+//   -m / --mouse        Nudge the pointer 1px toward the screen center after
+//                       --idle seconds, for apps that watch the cursor.
+//   -H / --hard-no-sleep  Root-only. Set the system-wide SleepDisabled gate.
+//   -L / --no-auto-lock Root-only, needs the user's login password. Temporary
+//                       Screen Lock/screensaver policy override.
+// Presets: -x/--rootless = -d -s -p -m; -a/--all = -x -H; -e/--everything =
+// -a -L. Only -e (through -L) ever asks for a password.
 //
 // Persistent settings are snapshotted before modification, and unreadable
 // snapshots prevent activation. Floating preferences are compared within the
@@ -31,7 +32,7 @@
 // refuse to start, so a later run can never mistake half-restored state for
 // the original. It lists the exact commands to restore by hand.
 //
-// In -a mode the user's login password is read from /dev/tty, never placed in
+// In -L mode the user's login password is read from /dev/tty, never placed in
 // argv/environment or the recovery file. Its main buffers are mlock()'d,
 // core dumps are disabled, and both parent and watchdog explicitly wipe them.
 // The authentication tool also receives the secret via a private terminal.
@@ -47,6 +48,8 @@
 #include <IOKit/ps/IOPSKeys.h>
 #include <IOKit/ps/IOPowerSources.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include <IOKit/hidsystem/IOHIDLib.h>
+#include <IOKit/hidsystem/IOHIDShared.h>
 #include <dispatch/dispatch.h>
 #include <notify.h>
 #include <SystemConfiguration/SystemConfiguration.h>
@@ -89,25 +92,33 @@
 #include <sys/stat.h>
 #include <termios.h>
 #include <util.h>
+#include <libproc.h>
+#include <mach-o/dyld.h>
+#include <sys/kauth.h>
+#include <sys/sysctl.h>
 
 static const char *kVersion = "2.0.0";
 
 // ---------------------------------------------------------------- config ---
 
+// Trailing verb: plain run, or the background-instance commands.
+enum class Command { Run, On, Off, Status };
+
 struct Config {
-    bool   all            = false;  // -a: aggressive no-sleep + no-auto-lock
-    bool   max            = false;  // -x: every layer that works without root
+    // Methods: one flag each; presets turn several on.
     bool   display        = false;  // -d: also prevent display sleep
-    bool   strong         = false;  // hold the PreventSystemSleep assertion
-    bool   jiggle         = true;   // --no-jiggle disables input layer
-    bool   noJiggleExplicit = false;
+    bool   strong         = false;  // -s: hold the PreventSystemSleep assertion
+    bool   presence       = false;  // -p: null HID event after --idle seconds
+    bool   mouse          = false;  // -m: 1px pointer nudge after --idle seconds
+    bool   hardNoSleep    = false;  // -H: system-wide SleepDisabled (root)
+    bool   lockOverride   = false;  // -L: disable automatic Screen Lock (root
+                                    //     and the user's login password)
+    // Options.
     bool   acOnly         = false;  // -A: hold assertions only on AC power
-    bool   drift          = false;  // --drift: don't restore cursor position
-    bool   requestPerm    = false;  // --request-permission: prompt for TCC
-    bool   hardNoSleep    = false;  // -H: system-wide SleepDisabled
-    bool   idleProbe      = false;  // diagnostic only; run after validation
+    bool   probe          = false;  // --probe: diagnostics only, after validation
+    Command command       = Command::Run;  // on / off / status
     int    minBattery     = 0;      // -b: pause below this % when on battery
-    double idleThreshold  = 120.0;  // -i: seconds of real idle before jiggle
+    double idleThreshold  = 120.0;  // -i: seconds of real idle before -p/-m act
     double timeout        = 0.0;    // -t: auto-exit after this many seconds
     pid_t  waitPid        = 0;      // -w: exit when this process exits
     int    verbose        = 0;      // -v
@@ -115,6 +126,12 @@ struct Config {
 };
 
 static Config cfg;
+
+// -H and -L are the two root-only layers; they share one rollback guard
+// (lock file, recovery marker, watchdog).
+static bool persistentPolicyMode(void) {
+    return cfg.hardNoSleep || cfg.lockOverride;
+}
 
 // ----------------------------------------------------------------- state ---
 
@@ -154,8 +171,16 @@ static IONotificationPortRef gNotifyPort      = nullptr;
 static io_object_t           gNotifier        = IO_OBJECT_NULL;
 static IOPMAssertionID       gUserActivityID  = kIOPMNullAssertionID;
 static CGEventSourceRef      gEventSource     = nullptr;
+static io_connect_t          gHIDConnect      = MACH_PORT_NULL;  // -p
+static bool                  gWarnedPoke      = false;
 static dispatch_source_t     gTimer           = nullptr;
-static uint64_t              gJiggleCount     = 0;
+static uint64_t              gJiggleCount     = 0;      // -m nudges posted
+static uint64_t              gPokeCount       = 0;      // -p null events posted
+static int64_t               gStartedAt       = 0;      // monotonic ms at launch
+static int                   gDaemonReadyFd   = -1;     // `on`: handshake to the parent
+static std::string           gDaemonRecordPath;         // `on`: registry entry
+static uid_t                 gConsoleUid      = (uid_t)-1;  // -p under sudo
+static gid_t                 gConsoleGid      = (gid_t)-1;
 static int                   gHardGuardWrite  = -1;
 static pid_t                 gHardGuardPid    = 0;
 static int                   gPolicyLockFd    = -1;
@@ -215,6 +240,15 @@ __attribute__((format(printf, 1, 2)))
 static void warn(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     logLine(stderr, "! ", fmt, ap);
+    va_end(ap);
+}
+
+// Output the user explicitly asked for (the Ctrl-T status line): shown even
+// with --quiet.
+__attribute__((format(printf, 1, 2)))
+static void say(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    logLine(stdout, "", fmt, ap);
     va_end(ap);
 }
 
@@ -361,6 +395,23 @@ static int64_t monotonicMilliseconds(void) {
 static int64_t durationMilliseconds(double seconds) {
     // Round UP to the next millisecond: never shorten a requested duration.
     return (int64_t)std::ceil(seconds * 1000.0);
+}
+
+// "1h 30m 0s" style, for log lines a person reads. Negative clamps to zero.
+static const char *formatDuration(double seconds, char *buffer, size_t size) {
+    if (!(seconds > 0)) seconds = 0;
+    long long total = llround(seconds);
+    long long days = total / 86400, hours = (total / 3600) % 24,
+              minutes = (total / 60) % 60, secs = total % 60;
+    if (days > 0)
+        snprintf(buffer, size, "%lldd %lldh %lldm", days, hours, minutes);
+    else if (hours > 0)
+        snprintf(buffer, size, "%lldh %lldm %llds", hours, minutes, secs);
+    else if (minutes > 0)
+        snprintf(buffer, size, "%lldm %llds", minutes, secs);
+    else
+        snprintf(buffer, size, "%llds", secs);
+    return buffer;
 }
 
 // Returns true once the child was reaped; false if it is still running when
@@ -968,9 +1019,10 @@ static bool writePolicyStateMarker(void) {
     std::string text =
         "kafueineto changed system policy and has not confirmed restoring it.\n"
         "Restore the values below by hand, then delete this file to re-arm.\n\n";
-    text += "  sudo /usr/bin/pmset -a disablesleep " +
-            std::to_string(gOriginalSleepDisabled) + "\n";
-    if (cfg.all) {
+    if (cfg.hardNoSleep)
+        text += "  sudo /usr/bin/pmset -a disablesleep " +
+                std::to_string(gOriginalSleepDisabled) + "\n";
+    if (cfg.lockOverride) {
         std::string arg = lockModeArgument(gOriginalLockMode);
         text += "  sudo -H -u " + shellQuote(gConsoleUser.name) +
                 " /usr/sbin/sysadminctl -screenLock " +
@@ -1388,7 +1440,7 @@ static bool aggressivePreferencesAreSet(void) {
 }
 
 static bool applyAggressiveLockPolicy(void) {
-    if (!cfg.all) return true;
+    if (!cfg.lockOverride) return true;
     // Never mutate from an unrestorable snapshot, no matter how this was
     // reached — the startup abort is the first line, this is the invariant.
     if (gOriginalLockMode.kind == LockKind::Invalid) return false;
@@ -1405,7 +1457,7 @@ static bool applyAggressiveLockPolicy(void) {
 }
 
 static bool restoreOriginalLockPolicy(void) {
-    if (!cfg.all) return true;
+    if (!cfg.lockOverride) return true;
     // Restore the effective password policy first so cleanup fails secure.
     bool modeOK = setScreenLockMode(gOriginalLockMode);
     bool prefsOK = restoreOriginalPreferences();
@@ -1414,7 +1466,7 @@ static bool restoreOriginalLockPolicy(void) {
 }
 
 static bool repairAggressiveLockPolicy(const char *trigger, bool fullCheck) {
-    if (!cfg.all) return true;
+    if (!cfg.lockOverride) return true;
     if (gOriginalLockMode.kind == LockKind::Invalid) {
         // Unreachable while arming validates the snapshot; if it ever fires,
         // fail safe — but never silently into the 3-strike shutdown.
@@ -1453,7 +1505,7 @@ static bool repairAggressiveLockPolicy(const char *trigger, bool fullCheck) {
     // Repair each layer with the narrowest action that fixes it: only a real
     // Screen Lock mode change is worth a password authentication.
     if (prefDrift) {
-        warn("screen-saver preferences changed (%s); restoring aggressive "
+        warn("screen-saver preferences changed (%s); restoring the override "
              "values", trigger);
         ok = applyAggressivePreferences() && ok;
     }
@@ -1487,11 +1539,12 @@ static bool originalPreferencesAreRestored(void) {
 
 static bool persistentPolicyMatchesSnapshot(void) {
     int sleepDisabled = -1;
-    if (!readPmsetSleepDisabled(&sleepDisabled) ||
-        sleepDisabled != gOriginalSleepDisabled)
+    if (cfg.hardNoSleep &&
+        (!readPmsetSleepDisabled(&sleepDisabled) ||
+         sleepDisabled != gOriginalSleepDisabled))
         return false;
 
-    if (cfg.all) {
+    if (cfg.lockOverride) {
         LockMode current;
         if (!readScreenLockMode(&current) ||
             !lockModesEqual(current, gOriginalLockMode) ||
@@ -1503,7 +1556,7 @@ static bool persistentPolicyMatchesSnapshot(void) {
 
 static bool restorePersistentPolicySnapshot(void) {
     bool ok = true;
-    if (cfg.all) ok = restoreOriginalLockPolicy() && ok;
+    if (cfg.lockOverride) ok = restoreOriginalLockPolicy() && ok;
     // Guarded like every other persistent-layer accessor: without
     // --hard-no-sleep this never snapshotted SleepDisabled, so it must not
     // write a value it does not know.
@@ -1515,11 +1568,17 @@ static bool restorePersistentPolicySnapshot(void) {
 static void policyGuardWatchdog(int readFd, int lockFd, int readyFd,
                                 int64_t deadline) {
     gIsPolicyWatchdog = true;
+    // Not ours: the daemon handshake belongs to the parent alone, or the
+    // `on` caller would wait on this process too.
+    if (gDaemonReadyFd != -1) {
+        close(gDaemonReadyFd);
+        gDaemonReadyFd = -1;
+    }
     bool ready = setsid() != -1;
     // A guard born already past its deadline must fail the handshake, not
     // arm-then-instantly-restore underneath a starting parent.
     if (deadline > 0 && monotonicMilliseconds() >= deadline) ready = false;
-    if (cfg.all) {
+    if (cfg.lockOverride) {
         bool secretLocked =
             mlock(gLoginPassword.bytes, sizeof gLoginPassword.bytes) == 0;
         gLoginPassword.locked = secretLocked;
@@ -1595,10 +1654,13 @@ static void policyGuardWatchdog(int readFd, int lockFd, int readyFd,
 }
 
 static bool startPolicyGuard(void) {
-    if (!cfg.hardNoSleep) return true;
+    if (!persistentPolicyMode()) return true;
     if (geteuid() != 0) {
-        warn("%s", cfg.all ? "-a requires root; run through sudo"
-                           : "--hard-no-sleep requires root; run through sudo");
+        warn("%s requires root; run through sudo",
+             cfg.lockOverride && cfg.hardNoSleep
+                 ? "-H/--hard-no-sleep with -L/--no-auto-lock"
+             : cfg.lockOverride ? "-L/--no-auto-lock"
+                                : "-H/--hard-no-sleep");
         return false;
     }
 
@@ -1630,16 +1692,19 @@ static bool startPolicyGuard(void) {
         return false;
     }
 
-    if (!readPmsetSleepDisabled(&gOriginalSleepDisabled)) {
+    // Snapshot only what this run will change: -L alone leaves SleepDisabled
+    // untouched, so it must neither be recorded nor "restored".
+    if (cfg.hardNoSleep &&
+        !readPmsetSleepDisabled(&gOriginalSleepDisabled)) {
         warn("could not read SleepDisabled; refusing a change that cannot be "
              "restored safely");
         close(lockFd);
         return false;
     }
 
-    if (cfg.all) {
+    if (cfg.lockOverride) {
         if (!getConsoleUser(&gConsoleUser)) {
-            warn("-a requires one logged-in GUI user");
+            warn("--no-auto-lock requires one logged-in GUI user");
             close(lockFd);
             return false;
         }
@@ -1694,10 +1759,10 @@ static bool startPolicyGuard(void) {
         close(readyPipe[0]);
         // Grace period: the parent owns the timeout, and the watchdog is a
         // backstop. Identical deadlines would have both restoring at once,
-        // fighting each other's verification reads. -a teardown can spend
+        // fighting each other's verification reads. -L teardown can spend
         // 20 s in sysadminctl's pty timeout plus several defaults writes,
         // so its grace must comfortably cover a full worst-case restore.
-        int64_t grace = cfg.all ? 150000 : 45000;
+        int64_t grace = cfg.lockOverride ? 150000 : 45000;
         policyGuardWatchdog(guardPipe[0], lockFd, readyPipe[1],
                             gDeadline > 0 ? gDeadline + grace : 0);
     }
@@ -1761,17 +1826,15 @@ static bool startPolicyGuard(void) {
         return false;
     }
 
-    if (cfg.all) {
+    if (cfg.lockOverride) {
         char mode[64];
-        info("aggressive rollback guard armed for user %s "
-             "(original Screen Lock=%s, SleepDisabled=%d)",
-             gConsoleUser.name,
-             lockModeDescription(gOriginalLockMode, mode, sizeof mode),
-             gOriginalSleepDisabled);
-        warn("-a may keep a closed Mac running and disables automatic session "
-             "locking while active; never put it in a bag or leave it "
-             "unattended");
-    } else {
+        info("lock-policy rollback guard armed for user %s (original Screen "
+             "Lock=%s)", gConsoleUser.name,
+             lockModeDescription(gOriginalLockMode, mode, sizeof mode));
+        warn("--no-auto-lock disables automatic session locking while active; "
+             "do not leave the Mac unattended");
+    }
+    if (cfg.hardNoSleep) {
         info("hard no-sleep guard armed (previous SleepDisabled=%d)",
              gOriginalSleepDisabled);
         warn("--hard-no-sleep may keep a closed Mac running; never put it in a "
@@ -1816,7 +1879,7 @@ static int kernelSleepDisabled(void) {
 }
 
 static bool policyGuardAlive(void) {
-    if (!cfg.hardNoSleep) return true;
+    if (!persistentPolicyMode()) return true;
     if (gHardGuardPid <= 0) return false;
 
     int status = 0;
@@ -1961,9 +2024,9 @@ static bool setActive(bool active, const char *why) {
             ok = setHardSleepDisabled(true) && ok;
         if (cfg.hardNoSleep && !active && gHardSleepApplied)
             ok = setHardSleepDisabled(false) && ok;
-        if (cfg.all && active && !gLockPolicyApplied)
+        if (cfg.lockOverride && active && !gLockPolicyApplied)
             ok = applyAggressiveLockPolicy() && ok;
-        if (cfg.all && !active && gLockPolicyApplied)
+        if (cfg.lockOverride && !active && gLockPolicyApplied)
             ok = restoreOriginalLockPolicy() && ok;
         return ok;
     }
@@ -1972,7 +2035,7 @@ static bool setActive(bool active, const char *why) {
         // Persistent gates first. The already-armed watchdog owns rollback if
         // this function fails halfway through or the parent is killed.
         if (cfg.hardNoSleep && !setHardSleepDisabled(true)) return false;
-        if (cfg.all && !applyAggressiveLockPolicy()) {
+        if (cfg.lockOverride && !applyAggressiveLockPolicy()) {
             // A partial apply may already have landed (prefs written, mode
             // change unverified); undo what we can right away.
             (void)restoreOriginalLockPolicy();
@@ -1997,7 +2060,7 @@ static bool setActive(bool active, const char *why) {
         if (cfg.display) declareUserActivity();
         info("assertions up (%s)%s%s", why,
              cfg.hardNoSleep ? "; hard no-sleep active" : "",
-             cfg.all ? "; automatic Screen Lock disabled" : "");
+             cfg.lockOverride ? "; automatic Screen Lock disabled" : "");
         return true;
     }
 
@@ -2006,7 +2069,7 @@ static bool setActive(bool active, const char *why) {
     // Restore while the watchdog is still armed and waiting. After this
     // returns, closing its lifetime pipe makes the watchdog independently
     // verify the snapshot and repair anything the parent could not restore.
-    bool lockRestored = !cfg.all || restoreOriginalLockPolicy();
+    bool lockRestored = !cfg.lockOverride || restoreOriginalLockPolicy();
 
     releaseAssertion(gSystemAssertion);
     releaseAssertion(gStrongSystemAssertion);
@@ -2020,7 +2083,7 @@ static bool setActive(bool active, const char *why) {
          !cfg.hardNoSleep ? ""
          : sleepRestored ? "; previous sleep policy restored"
                          : "; watchdog will retry sleep restoration",
-         !cfg.all ? ""
+         !cfg.lockOverride ? ""
          : lockRestored ? "; previous Screen Lock policy restored"
                         : "; watchdog will retry Screen Lock restoration");
     return lockRestored && sleepRestored;
@@ -2151,14 +2214,18 @@ static void postMove(double x, double y) {
     }
 }
 
+// -m: one real pointer event.
 static void jiggleOnce(void) {
     CGPoint p;
-    if (!currentMouseLocation(&p)) return;  // never jiggle from a guessed spot
+    if (!currentMouseLocation(&p)) return;  // never nudge from a guessed spot
 
     // Strictly 1px toward the center of the display under the cursor: an
     // inward move can neither leave the display, cross onto a neighbor, nor
-    // step deeper into a hot corner — no clamping needed, and --drift
-    // converges on the display center instead of an edge.
+    // step deeper into a hot corner, so no clamping is needed, and repeated
+    // nudges converge on the display center instead of an edge. The pointer
+    // is deliberately left there: a real position change is the point of
+    // this method, for the rare app that polls cursor coordinates rather
+    // than the idle counters (the null event of -p covers those).
     double dx = -1.0;
     CGDirectDisplayID disp = kCGNullDirectDisplay;
     uint32_t nDisp = 0;
@@ -2169,73 +2236,136 @@ static void jiggleOnce(void) {
     } else if (p.x < 2.0) {
         dx = 1.0;
     }
-
     postMove(p.x + dx, p.y);
-
-    // --drift leaves the cursor 1px displaced: a real position change per
-    // jiggle, for the rare app that polls cursor coordinates instead of the
-    // idle counters. Drift is bounded — every nudge points at the display
-    // center.
-    if (!cfg.drift) {
-        usleep(25000);
-        // Restore only if the cursor is still where we put it (epsilon
-        // compare: Retina coordinates are fractional) — if the user moved it
-        // meanwhile, yanking it back would be worse than a 1px offset.
-        CGPoint q;
-        if (currentMouseLocation(&q) &&
-            fabs(q.x - (p.x + dx)) < 0.5 && fabs(q.y - p.y) < 0.5)
-            postMove(p.x, p.y);
-    }
-
     gJiggleCount++;
-    debug("jiggle #%llu at (%.0f, %.0f)",
-          (unsigned long long)gJiggleCount, p.x, p.y);
+    debug("nudge #%llu at (%.0f, %.0f)", (unsigned long long)gJiggleCount,
+          p.x, p.y);
 }
 
-static void maybeJiggle(void) {
-    if (!cfg.jiggle || !gActive) return;
+// -p: a null HID event through the IOHIDSystem parameter connection. It
+// resets both HID idle counters (CGEventSource's and the registry's
+// HIDIdleTime, which the screensaver timer and "away" detection read)
+// without moving anything. Verified on macOS 27; it needs the same
+// input-event permission as posting a real event.
+static bool openHIDConnection(void) {
+    if (gHIDConnect != MACH_PORT_NULL) return true;
+    io_service_t svc = IOServiceGetMatchingService(
+        kIOMainPortDefault, IOServiceMatching("IOHIDSystem"));
+    if (svc == IO_OBJECT_NULL) return false;
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(),
+                                     kIOHIDParamConnectType, &gHIDConnect);
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS) {
+        gHIDConnect = MACH_PORT_NULL;
+        return false;
+    }
+    return true;
+}
+
+static IOReturn postNullEvent(void) {
+    NXEventData data;
+    memset(&data, 0, sizeof data);
+    IOGPoint where = {0, 0};
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return IOHIDPostEvent(gHIDConnect, NX_NULLEVENT, where, &data,
+                          kNXEventDataVersion, 0, 0);
+#pragma clang diagnostic pop
+}
+
+static void pokeOnce(void) {
+    if (!openHIDConnection()) {
+        if (!gWarnedPoke) {
+            warn("presence poke unavailable: IOHIDSystem could not be opened");
+            gWarnedPoke = true;
+        }
+        return;
+    }
+    IOReturn r = postNullEvent();
+    if (r != kIOReturnSuccess && geteuid() == 0 && gConsoleUid != (uid_t)-1) {
+        // Under sudo the HID system may accept events only from the console
+        // user's credentials. Switch this thread's identity for the one call
+        // (per-thread, so the power queue is unaffected) and retry.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if (pthread_setugid_np(gConsoleUid, gConsoleGid) == 0) {
+            r = postNullEvent();
+            pthread_setugid_np(KAUTH_UID_NONE, KAUTH_GID_NONE);
+        }
+#pragma clang diagnostic pop
+    }
+    if (r != kIOReturnSuccess) {
+        if (!gWarnedPoke) {
+            warn("presence poke failed (IOReturn 0x%x); input events can only "
+                 "be posted from the console user's own session", r);
+            gWarnedPoke = true;
+        }
+        return;
+    }
+    if (gWarnedPoke) {
+        info("presence poke working again");
+        gWarnedPoke = false;
+    }
+    gPokeCount++;
+    debug("presence poke #%llu", (unsigned long long)gPokeCount);
+}
+
+static void maybePresence(void) {
+    if ((!cfg.presence && !cfg.mouse) || !gActive) return;
 
     if (!canPostEvents()) {
         if (!gWarnedNoPerm) {
-            warn("mouse jiggle unavailable: this process lacks permission to "
-                 "post input events.");
+            warn("-p/-m unavailable: this process lacks permission to post "
+                 "input events.");
             warn("grant it in System Settings > Privacy & Security > "
                  "Accessibility (add your terminal app, or kafueineto itself "
-                 "when run from launchd), or rerun with --request-permission.");
+                 "when run from launchd); macOS showed its request dialog at "
+                 "startup if it allowed one.");
             warn("open the pane directly: open "
                  "\"x-apple.systempreferences:com.apple.preference.security"
                  "?Privacy_Accessibility\"");
-            warn("power assertions remain fully active without it.");
+            warn("sleep prevention remains fully active without it.");
             gWarnedNoPerm = true;
         }
         return;
     }
     if (gWarnedNoPerm) {
-        info("input-event permission granted; jiggle enabled");
+        info("input-event permission granted; -p/-m enabled");
         gWarnedNoPerm = false;
     }
 
     double idle = userIdleSeconds();
     if (idle < cfg.idleThreshold) {
-        debug("idle %.0fs < %.0fs threshold; no jiggle", idle,
+        debug("idle %.0fs < %.0fs threshold; user is present", idle,
               cfg.idleThreshold);
         return;
     }
-    if (anyMouseButtonDown()) {
-        debug("mouse button held; skipping jiggle");
-        return;
-    }
     if (screenLocked()) {
-        debug("screen locked; skipping jiggle");
+        debug("screen locked; not simulating presence");
         return;
     }
     if (CGDisplayIsAsleep(CGMainDisplayID())) {
-        // A display that already went dark stays dark — waking it every
-        // threshold seconds forever would be worse than any missed jiggle.
-        debug("display asleep; skipping jiggle");
+        // A display that already went dark stays dark: waking it every
+        // threshold seconds forever would be worse than any missed poke.
+        debug("display asleep; not simulating presence");
         return;
     }
-    jiggleOnce();
+    if (cfg.presence) pokeOnce();
+    if (cfg.mouse) {
+        if (anyMouseButtonDown()) debug("mouse button held; skipping nudge");
+        else jiggleOnce();
+    }
+}
+
+// " | 3 pokes, 1 nudge", or nothing when no presence method is on.
+static const char *inputCounts(char *buffer, size_t size) {
+    buffer[0] = '\0';
+    if (cfg.presence || cfg.mouse)
+        snprintf(buffer, size, " | %llu poke%s, %llu nudge%s",
+                 (unsigned long long)gPokeCount, gPokeCount == 1 ? "" : "s",
+                 (unsigned long long)gJiggleCount,
+                 gJiggleCount == 1 ? "" : "s");
+    return buffer;
 }
 
 // ----------------------------------------------------------- diagnostics ---
@@ -2284,6 +2414,378 @@ static int idleProbe(void) {
     return 0;
 }
 
+// ------------------------------------------------ sudo + background mode ---
+
+static void shutdownNow(const char *reason, int code);
+
+// Root-only methods re-run the whole command line through sudo, which
+// prompts on the terminal when it has to.
+static void reexecWithSudo(int argc, char **argv, const char *why) {
+    char path[PATH_MAX];
+    uint32_t size = sizeof path;
+    char real[PATH_MAX];
+    if (_NSGetExecutablePath(path, &size) != 0 || !realpath(path, real)) {
+        warn("could not find my own executable to re-run it through sudo");
+        return;
+    }
+    fprintf(stderr, "kafueineto: %s; re-running through sudo\n", why);
+    std::vector<char *> args;
+    args.push_back(const_cast<char *>("sudo"));
+    args.push_back(const_cast<char *>("--"));
+    args.push_back(real);
+    for (int i = 1; i < argc; i++) args.push_back(argv[i]);
+    args.push_back(nullptr);
+    execv("/usr/bin/sudo", args.data());
+    warn("could not run sudo: %s", strerror(errno));
+    exit(1);
+}
+
+static void maybeReexecWithSudo(int argc, char **argv) {
+    if (persistentPolicyMode() && geteuid() != 0)
+        reexecWithSudo(argc, argv, "-H and -L need root");
+}
+
+// Background instances leave a small record so `off` and `status` can find
+// them: /var/db/kafueineto/daemons/<pid> for root, otherwise
+// ~/Library/Application Support/kafueineto/daemons/<pid>.
+static const char *kRootRegistryDir = "/var/db/kafueineto/daemons";
+static const char *kRootLogPath = "/var/log/kafueineto.log";
+
+static std::string homeOf(uid_t uid) {
+    struct passwd pwd = {};
+    struct passwd *result = nullptr;
+    char buffer[16384];
+    if (getpwuid_r(uid, &pwd, buffer, sizeof buffer, &result) != 0 ||
+        !result || !result->pw_dir || result->pw_dir[0] != '/')
+        return std::string();
+    return result->pw_dir;
+}
+
+// Under sudo "the user" is whoever typed the command, not root.
+static uid_t invokingUid(void) {
+    const char *sudoUid = getenv("SUDO_UID");
+    if (geteuid() == 0 && sudoUid && *sudoUid) {
+        char *end = nullptr;
+        long value = strtol(sudoUid, &end, 10);
+        if (end != sudoUid && *end == '\0' && value > 0 && value <= INT_MAX)
+            return (uid_t)value;
+    }
+    return getuid();
+}
+
+static std::string userRegistryDir(uid_t uid) {
+    std::string home = homeOf(uid);
+    return home.empty() ? home
+                        : home + "/Library/Application Support/kafueineto/daemons";
+}
+
+static std::string daemonLogPath(void) {
+    if (geteuid() == 0) return kRootLogPath;
+    std::string home = homeOf(getuid());
+    return home.empty() ? home : home + "/Library/Logs/kafueineto.log";
+}
+
+static bool makeDirectories(const std::string &path, mode_t mode) {
+    for (size_t i = 1; i <= path.size(); i++) {
+        if (i != path.size() && path[i] != '/') continue;
+        std::string partial = path.substr(0, i);
+        if (mkdir(partial.c_str(), mode) != 0 && errno != EEXIST) return false;
+    }
+    return true;
+}
+
+// Pids get reused: only ever signal a process that really is kafueineto.
+static bool isKafueinetoProcess(pid_t pid, bool *known) {
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    *known = proc_pidpath(pid, path, sizeof path) > 0;
+    if (!*known) return false;
+    const char *base = strrchr(path, '/');
+    return strcmp(base ? base + 1 : path, "kafueineto") == 0;
+}
+
+struct DaemonRecord {
+    pid_t pid = 0;
+    std::string file;
+    std::string details;
+    enum { Running, Foreign, Stale } state = Stale;  // Foreign: alive, not ours
+};
+
+// One registry directory. A record is Stale when its pid is gone or belongs
+// to some other program now; stale records are removed on the way.
+static void scanRegistryDir(const std::string &dir,
+                            std::vector<DaemonRecord> *out) {
+    DIR *d = opendir(dir.c_str());
+    if (!d) return;
+    for (;;) {
+        errno = 0;
+        const struct dirent *entry = readdir(d);
+        if (!entry) break;
+        char *end = nullptr;
+        long pid = strtol(entry->d_name, &end, 10);
+        if (end == entry->d_name || *end != '\0' || pid <= 0 || pid > INT_MAX)
+            continue;
+        DaemonRecord record;
+        record.pid = (pid_t)pid;
+        record.file = dir + "/" + entry->d_name;
+        if (FILE *f = fopen(record.file.c_str(), "r")) {
+            char buffer[512];
+            size_t n;
+            while ((n = fread(buffer, 1, sizeof buffer, f)) > 0 &&
+                   record.details.size() < 4096)
+                record.details.append(buffer, n);
+            fclose(f);
+        }
+        int alive = kill(record.pid, 0);
+        if (alive == 0 || errno == EPERM) {
+            bool known = false;
+            bool ours = isKafueinetoProcess(record.pid, &known);
+            if (known && !ours) record.state = DaemonRecord::Stale;
+            else record.state = alive == 0 ? DaemonRecord::Running
+                                           : DaemonRecord::Foreign;
+        } else {
+            record.state = DaemonRecord::Stale;
+        }
+        if (record.state == DaemonRecord::Stale) unlink(record.file.c_str());
+        out->push_back(record);
+    }
+    closedir(d);
+}
+
+static void scanRegistries(std::vector<DaemonRecord> *out) {
+    scanRegistryDir(kRootRegistryDir, out);
+    std::string user = userRegistryDir(invokingUid());
+    if (!user.empty()) scanRegistryDir(user, out);
+}
+
+static bool recoveryMarkerPresent(void) {
+    struct stat st;
+    return lstat(kPolicyStatePath, &st) == 0;
+}
+
+// Every other kafueineto process on the system, any user, minus rollback
+// watchdogs (forked copies whose parent is itself an instance).
+static std::vector<pid_t> otherKafueinetoInstances(void) {
+    std::vector<pid_t> result;
+    int bytes = proc_listpids(PROC_ALL_PIDS, 0, nullptr, 0);
+    if (bytes <= 0) return result;
+    std::vector<pid_t> pids((size_t)bytes / sizeof(pid_t) + 64);
+    bytes = proc_listpids(PROC_ALL_PIDS, 0, pids.data(),
+                          (int)(pids.size() * sizeof(pid_t)));
+    if (bytes <= 0) return result;
+    pids.resize((size_t)bytes / sizeof(pid_t));
+    std::vector<pid_t> all;
+    for (pid_t pid : pids) {
+        bool known = false;
+        if (pid > 0 && pid != getpid() && isKafueinetoProcess(pid, &known))
+            all.push_back(pid);
+    }
+    for (pid_t pid : all) {
+        // sysctl, not proc_pidinfo: the latter refuses other users' processes
+        // to an unprivileged caller, and root instances are the common case.
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+        struct kinfo_proc info;
+        size_t size = sizeof info;
+        bool watchdog = false;
+        if (sysctl(mib, 4, &info, &size, nullptr, 0) == 0 && size == sizeof info)
+            for (pid_t parent : all)
+                if (info.kp_eproc.e_ppid == parent) watchdog = true;
+        if (!watchdog) result.push_back(pid);
+    }
+    return result;
+}
+
+// The recovery record is expected while any instance holds sudo settings;
+// left behind with no instance running, it means a restoration was never
+// confirmed. Returns true for the latter.
+static bool reportRecoveryRecord(void) {
+    if (!recoveryMarkerPresent()) return false;
+    std::vector<pid_t> others = otherKafueinetoInstances();
+    if (!others.empty()) {
+        printf("recovery record %s is in use by the running instance pid %d\n",
+               kPolicyStatePath, (int)others[0]);
+        return false;
+    }
+    warn("restoration of a previous sudo instance was not confirmed; see %s",
+         kPolicyStatePath);
+    return true;
+}
+
+static void listForegroundInstances(void) {
+    for (pid_t pid : otherKafueinetoInstances())
+        printf("pid %d is running in the foreground (not started with `on`; "
+               "stop it with Ctrl-C there)\n", (int)pid);
+}
+
+static int showDaemons(void) {
+    std::vector<DaemonRecord> records;
+    scanRegistries(&records);
+    int shown = 0;
+    for (const DaemonRecord &r : records) {
+        if (r.state == DaemonRecord::Stale) continue;
+        printf("pid %d%s\n%s", (int)r.pid,
+               r.state == DaemonRecord::Foreign ? " (sudo instance)" : "",
+               r.details.c_str());
+        shown++;
+    }
+    if (!shown) puts("no background instance is running");
+    listForegroundInstances();
+    reportRecoveryRecord();
+    return 0;
+}
+
+static int stopDaemons(int argc, char **argv) {
+    std::vector<DaemonRecord> records;
+    scanRegistries(&records);
+    std::vector<DaemonRecord> running;
+    bool foreign = false;
+    for (const DaemonRecord &r : records) {
+        if (r.state == DaemonRecord::Running) running.push_back(r);
+        else if (r.state == DaemonRecord::Foreign) foreign = true;
+    }
+    if (foreign && geteuid() != 0)
+        reexecWithSudo(argc, argv, "a sudo instance is running");
+    if (running.empty()) {
+        puts("no background instance is running");
+        listForegroundInstances();
+        return reportRecoveryRecord() ? 1 : 0;
+    }
+    for (const DaemonRecord &r : running) {
+        if (kill(r.pid, SIGTERM) == 0) printf("stopping pid %d\n", (int)r.pid);
+        else warn("could not signal pid %d: %s", (int)r.pid, strerror(errno));
+    }
+    // Restoring sudo settings can take a while (sysadminctl alone may need
+    // 20 s); wait, and say so once it stops being instant.
+    int64_t started = monotonicMilliseconds();
+    bool announced = false;
+    for (;;) {
+        bool any = false;
+        for (const DaemonRecord &r : running)
+            if (kill(r.pid, 0) == 0 || errno == EPERM) any = true;
+        if (!any) break;
+        int64_t elapsed = monotonicMilliseconds() - started;
+        if (elapsed >= 90000) break;
+        if (!announced && elapsed >= 2000) {
+            puts("waiting for settings to be restored...");
+            announced = true;
+        }
+        poll(nullptr, 0, 250);
+    }
+    int code = 0;
+    for (const DaemonRecord &r : running) {
+        bool gone = kill(r.pid, 0) == -1 && errno == ESRCH;
+        printf("pid %d %s\n", (int)r.pid,
+               gone ? "stopped" : "still running after 90 s");
+        if (!gone) code = 1;
+    }
+    listForegroundInstances();
+    if (reportRecoveryRecord()) code = 1;
+    return code;
+}
+
+// `on`, step 1: fork. The child does the whole startup on the terminal, so
+// errors and the -L password prompt appear as usual; the parent waits for
+// the child's ready byte, prints the pid, and leaves.
+static int spawnDaemon(void) {
+    int fds[2];
+    if (!createPipe(fds)) {
+        warn("could not create the background handshake: %s", strerror(errno));
+        exit(1);
+    }
+    fflush(nullptr);
+    pid_t pid = fork();
+    if (pid == -1) {
+        warn("could not fork: %s", strerror(errno));
+        exit(1);
+    }
+    if (pid == 0) {
+        close(fds[0]);
+        gDaemonReadyFd = fds[1];
+        return fds[1];
+    }
+    close(fds[1]);
+    char byte = 0;
+    ssize_t n;
+    do {
+        n = read(fds[0], &byte, 1);
+    } while (n == -1 && errno == EINTR);
+    close(fds[0]);
+    if (n == 1 && byte == 'R') {
+        printf("kafueineto: running in the background as pid %d\n"
+               "  stop:   kafueineto off\n"
+               "  status: kafueineto status\n"
+               "  log:    %s\n", (int)pid, daemonLogPath().c_str());
+        exit(0);
+    }
+    int status = 0;
+    waitForChild(pid, &status);
+    exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+}
+
+// `on`, step 2, once everything is up: record, log, detach, tell the parent.
+static void finishDaemon(int readyFd, int argc, char **argv) {
+    std::string log = daemonLogPath();
+    std::string dir = geteuid() == 0 ? kRootRegistryDir
+                                     : userRegistryDir(getuid());
+    size_t slash = log.rfind('/');
+    if (log.empty() || dir.empty() || !makeDirectories(dir, 0755) ||
+        (slash != std::string::npos &&
+         !makeDirectories(log.substr(0, slash), 0755)))
+        shutdownNow("could not create the background record directory", 1);
+    int logFd = open(log.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                     0644);
+    if (logFd == -1) {
+        warn("could not open %s: %s", log.c_str(), strerror(errno));
+        shutdownNow("could not open the background log", 1);
+    }
+
+    char when[32];
+    time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tmv);
+    std::string command = "kafueineto";
+    for (int i = 1; i < argc; i++) command += std::string(" ") + argv[i];
+    std::string record = std::string("  started ") + when + "\n  command " +
+                         command + "\n  log " + log + "\n";
+    gDaemonRecordPath = dir + "/" + std::to_string((long long)getpid());
+    int recordFd = open(gDaemonRecordPath.c_str(),
+                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (recordFd == -1 || !writeAll(recordFd, record.data(), record.size())) {
+        warn("could not write %s: %s", gDaemonRecordPath.c_str(),
+             strerror(errno));
+        if (recordFd != -1) close(recordFd);
+        gDaemonRecordPath.clear();
+        shutdownNow("could not write the background record", 1);
+    }
+    close(recordFd);
+
+    int devNull = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (devNull != -1) {
+        dup2(devNull, STDIN_FILENO);
+        close(devNull);
+    }
+    dup2(logFd, STDOUT_FILENO);
+    dup2(logFd, STDERR_FILENO);
+    close(logFd);
+    (void)setsid();
+    (void)chdir("/");
+    info("background instance started: %s", command.c_str());
+
+    char byte = 'R';
+    ssize_t w;
+    do {
+        w = write(readyFd, &byte, 1);
+    } while (w == -1 && errno == EINTR);
+    close(readyFd);
+    gDaemonReadyFd = -1;
+}
+
+static void removeDaemonRecord(void) {
+    if (gDaemonRecordPath.empty()) return;
+    unlink(gDaemonRecordPath.c_str());
+    gDaemonRecordPath.clear();
+}
+
 // ------------------------------------------------------------- lifecycle ---
 
 static void teardownPowerNotifications(void) {
@@ -2307,8 +2809,11 @@ static void teardownPowerNotifications(void) {
 static bool policyGuardAlive(void);
 
 static void shutdownNow(const char *reason, int code) {
-    info("exiting: %s (%llu jiggle%s posted)", reason,
-         (unsigned long long)gJiggleCount, gJiggleCount == 1 ? "" : "s");
+    char ran[48], counts[64];
+    info("exiting: %s after %s%s", reason,
+         formatDuration((monotonicMilliseconds() - gStartedAt) / 1000.0, ran,
+                        sizeof ran),
+         inputCounts(counts, sizeof counts));
     // Restore in the parent while the watchdog is still blocked on its
     // lifetime pipe. Closing the pipe then makes the watchdog verify the exact
     // snapshot and retry any part the parent could not restore.
@@ -2317,7 +2822,7 @@ static void shutdownNow(const char *reason, int code) {
     // below must not come off on anything weaker (e.g. the watchdog dying
     // between the aliveness check here and a later one).
     bool verifiedRestore = false;
-    if (cfg.hardNoSleep && !policyGuardAlive()) {
+    if (persistentPolicyMode() && !policyGuardAlive()) {
         // No watchdog left to repair behind us. Judge by what the system
         // actually reads back, not by whether a command reported success —
         // a transient tool outage must not brick future runs. Check first
@@ -2355,6 +2860,7 @@ static void shutdownNow(const char *reason, int code) {
         gEventSource = nullptr;
     }
     teardownPowerNotifications();
+    removeDaemonRecord();
     exit(code);
 }
 
@@ -2402,8 +2908,8 @@ static void powerCallback(void *refcon, io_service_t service,
 }
 
 static bool wantActiveNow(const char **why) {
-    if (cfg.all) {
-        *why = "aggressive all-mode";
+    if (cfg.lockOverride) {
+        *why = "lock override active";
         return true;
     }
     if (onACPower()) {
@@ -2426,13 +2932,13 @@ static void reconcile(const char *trigger) {
     if (gDeadline > 0 && monotonicMilliseconds() >= gDeadline)
         shutdownNow("timeout reached", 0);
 
-    if (cfg.hardNoSleep && !policyGuardAlive()) {
+    if (persistentPolicyMode() && !policyGuardAlive()) {
         warn("cleanup watchdog exited unexpectedly; terminating rather than "
              "running with persistent settings but no rollback owner");
         shutdownNow("policy watchdog failure", 1);
     }
 
-    if (cfg.all) {
+    if (cfg.lockOverride) {
         ConsoleUser now;
         if (!getConsoleIdentity(&now)) {
             // configd/directory hiccups happen; only a sustained absence
@@ -2491,20 +2997,24 @@ static void reconcile(const char *trigger) {
             declareUserActivity();
         }
 
-        if (cfg.all) {
+        if (cfg.lockOverride) {
             // A failure or filesystem event forces one full preference
-            // check; otherwise the expensive full check runs every 5th tick.
+            // check (six `defaults` spawns). The vnode watchers on the two
+            // preference directories catch local edits as they land, so the
+            // periodic sweep is only a backstop for stores they cannot see
+            // (managed preferences); every 15th tick keeps the steady-state
+            // spawn rate down to the 1 Hz sysadminctl status poll.
             bool fullCheck = gForceFullPolicyCheck ||
                              gPolicyFailures > 0 ||
-                             (gAggressiveTicks % 5) == 0;
+                             (gAggressiveTicks % 15) == 0;
             gForceFullPolicyCheck = false;
             ok = repairAggressiveLockPolicy(trigger, fullCheck) && ok;
 
             bool locked = screenLocked();
             if (locked && !gLastScreenLocked) {
-                warn("the GUI session became locked despite -a; authentication "
-                     "is never bypassed, so unlock it manually. Policy "
-                     "reconciliation remains active");
+                warn("the GUI session became locked despite --no-auto-lock; "
+                     "authentication is never bypassed, so unlock it manually. "
+                     "Policy reconciliation remains active");
             }
             gLastScreenLocked = locked;
         }
@@ -2532,13 +3042,13 @@ static void reconcile(const char *trigger) {
 static void tick(void) {
     if (gDeadline > 0 && monotonicMilliseconds() >= gDeadline)
         shutdownNow("timeout reached", 0);
-    if (cfg.all) gAggressiveTicks++;
+    if (cfg.lockOverride) gAggressiveTicks++;
     reconcile("periodic check");
-    maybeJiggle();
+    maybePresence();
 }
 
 static void setupPreferenceWatchers(dispatch_queue_t queue) {
-    if (!cfg.all) return;
+    if (!cfg.lockOverride) return;
 
     std::string paths[2] = {
         std::string(gConsoleUser.home) + "/Library/Preferences",
@@ -2571,87 +3081,75 @@ static void setupPreferenceWatchers(dispatch_queue_t queue) {
     }
 }
 
+// Ctrl-T (SIGINFO): one status line, without stopping anything.
+static void printStatus(void) {
+    char up[48], left[64] = "";
+    int64_t now = monotonicMilliseconds();
+    formatDuration((now - gStartedAt) / 1000.0, up, sizeof up);
+    if (gDeadline > 0) {
+        char remaining[48];
+        snprintf(left, sizeof left, " | stops in %s",
+                 formatDuration((gDeadline - now) / 1000.0, remaining,
+                                sizeof remaining));
+    }
+    char counts[64];
+    say("status: %s | running %s%s%s%s%s%s%s",
+        gActive ? "sleep prevention active" : "paused by power conditions",
+        up, left,
+        inputCounts(counts, sizeof counts),
+        gActive && cfg.display ? " | display kept awake" : "",
+        gActive && cfg.hardNoSleep ? " | hard no-sleep" : "",
+        gActive && cfg.lockOverride ? " | automatic Screen Lock disabled" : "",
+        cfg.waitPid > 0 ? " | watching a process" : "");
+}
+
 // ------------------------------------------------------------------ args ---
 
 static void usage(FILE *to) {
     fprintf(to,
         "kafueineto %s - keep your Mac awake\n"
         "\n"
-        "Usage: kafueineto [options]\n"
+        "Usage: kafueineto [preset] [methods] [options] [on]\n"
+        "       kafueineto off | status\n"
         "\n"
-        "With no options, prevents idle system sleep and nudges the mouse after\n"
-        "2 minutes of inactivity; the display may still sleep. Ctrl-C stops it.\n"
+        "No flags: hold an idle-sleep assertion, like caffeinate -i. Add methods\n"
+        "or a preset. Ctrl-C stops; Ctrl-T prints a status line.\n"
         "\n"
-        "Without sudo (each row adds to the ones above it)\n"
-        "  (default)              Prevent idle system sleep.\n"
-        "  -d, --display          Also keep the display awake while it is on.\n"
-        "  -x, --max              Also hold the stronger system-sleep assertion,\n"
-        "                         nudge the mouse, and request input permission:\n"
-        "                         everything that works without sudo. Combine\n"
-        "                         freely with -n, -A, -b, -t, or -w.\n"
+        "Presets\n"
+        "  -x, --rootless       everything that works without sudo: -d -s -p -m\n"
+        "  -a, --all            everything without a password: -x -H (uses sudo)\n"
+        "  -e, --everything     everything: -a -L (uses sudo and your login password)\n"
         "\n"
-        "With sudo (changes system settings; restored on exit or by a watchdog)\n"
-        "  -H, --hard-no-sleep    Set the system-wide sleep-disable setting (pmset\n"
-        "                         disablesleep) and hold the strong assertion.\n"
-        "                         Add -d or -x for the display and mouse layers.\n"
-        "  -a, --all              Everything: -x and -H plus a temporary override\n"
-        "                         of automatic screen locking for the logged-in\n"
-        "                         user, who types their login password privately\n"
-        "                         in the terminal. Cannot combine with -A, -b, -n.\n"
+        "Methods\n"
+        "  -d, --display        keep the display awake\n"
+        "  -s, --strong         also hold the strong system-sleep assertion (AC only)\n"
+        "  -p, --presence       look present: invisible null HID event after --idle\n"
+        "  -m, --mouse          nudge the pointer one pixel after --idle\n"
+        "  -H, --hard-no-sleep  sudo: pmset disablesleep, also blocks lid/menu sleep\n"
+        "  -L, --no-auto-lock   sudo + password: no automatic Screen Lock (not -A/-b)\n"
         "\n"
-        "When to stop\n"
-        "  -t, --timeout DURATION Stop after this duration (cleanup may take longer).\n"
-        "  -w, --waitpid PID      Stop when an existing process exits.\n"
+        "Options\n"
+        "  -i, --idle DUR       idle time before -p/-m act (default 120s, min 5s)\n"
+        "  -t, --timeout DUR    stop after DUR: 90, 45m, 1.5h, 1d\n"
+        "  -w, --waitpid PID    stop when PID exits\n"
+        "  -A, --ac-only        pause on battery\n"
+        "  -b, --min-battery N  pause below N%% battery\n"
+        "      --probe          print idle, permission, power and lid status; exit\n"
+        "  -v, --verbose        show every decision     -q, --quiet   warnings only\n"
+        "  -V, --version        print the version       -h, --help    this text\n"
         "\n"
-        "Power\n"
-        "  -A, --ac-only          Pause while on battery; resume on AC power.\n"
-        "  -b, --min-battery PCT  Pause below this battery level (1-100).\n"
+        "Background\n"
+        "  kafueineto [flags] on   start in the background (log: ~/Library/Logs/\n"
+        "                          kafueineto.log, or /var/log/kafueineto.log with sudo)\n"
+        "  kafueineto off          stop every background instance, restore settings\n"
+        "  kafueineto status       list background instances\n"
         "\n"
-        "Mouse input\n"
-        "  -n, --no-jiggle        Never move the mouse. Sleep prevention still\n"
-        "                         works, and no Accessibility permission is needed.\n"
-        "  -i, --idle DURATION    Idle time before a nudge (default 120s, min 5s).\n"
-        "      --drift            Leave each nudge in place (drifting toward the\n"
-        "                         screen center) instead of returning the pointer.\n"
-        "      --request-permission\n"
-        "                         Ask macOS for the Accessibility permission mouse\n"
-        "                         input needs (-x and -a do this automatically).\n"
-        "\n"
-        "Information\n"
-        "      --idle-probe       Print idle, permission, power, and lid status\n"
-        "                         without changing anything, then exit.\n"
-        "  -v, --verbose          Show every decision.\n"
-        "  -q, --quiet            Show only warnings and errors (overrides -v).\n"
-        "  -V, --version          Print the version and exit.\n"
-        "  -h, --help             Show this help and exit.\n"
-        "\n"
-        "Durations are seconds, or a number with s, m, h, or d: 90, 45m, 1.5h, 1d.\n"
-        "Timeouts run from 1s to 3650d and start after any password prompt. With\n"
-        "both --timeout and --waitpid, whichever comes first ends the run.\n"
-        "Aliases: --all-rootless = --max; --aggressive = --all;\n"
-        "         --resist-all-sleep = --hard-no-sleep.\n"
-        "\n"
-        "Examples\n"
-        "  kafueineto -n -t 45m          Stay awake 45 minutes, never touch the mouse.\n"
-        "  kafueineto -x                 Strongest protection available without sudo.\n"
-        "  kafueineto -x -A -w 1234      Same, only on AC power, until pid 1234 exits.\n"
-        "  sudo kafueineto -H -t 2h      Also set the system sleep-disable switch.\n"
-        "  sudo kafueineto -a -t 30m     Also keep the session from auto-locking.\n"
-        "\n"
-        "Safety and recovery\n"
-        "Sudo modes may keep a closed laptop running: keep it ventilated and\n"
-        "never put it in a bag while active. With --all, do not leave it\n"
-        "unattended. No mode unlocks a locked session or guarantees blocking\n"
-        "every kind of sleep; manual locking, managed policy, shutdown, restart,\n"
-        "and hardware safety limits are never bypassed.\n"
-        "\n"
-        "A cleanup watchdog restores the sudo-mode settings after exit or a crash.\n"
-        "Until that is verified, the original values stay in\n"
-        "/var/db/kafueineto-policy.state. If the file remains, read it with sudo,\n"
-        "restore the listed values, then remove it; sudo modes refuse to start\n"
-        "while it exists.\n"
-        "\n"
-        "Exit codes: 0 = normal stop; 1 = runtime or cleanup error; 2 = bad options.\n",
+        "Sudo methods re-run the command through sudo; a watchdog restores their\n"
+        "settings on exit. If /var/db/kafueineto-policy.state remains afterwards,\n"
+        "restoration was not confirmed: read it with sudo, restore the values, then\n"
+        "delete it. -H/-a/-e can keep a closed laptop running: keep it ventilated.\n"
+        "With -L/-e do not leave the Mac unattended.\n"
+        "Exit codes: 0 ok, 1 runtime or cleanup error, 2 bad usage.\n",
         kVersion);
 }
 
@@ -2692,38 +3190,48 @@ static bool parseInteger(const char *s, long minimum, long maximum, long *out) {
 }
 
 static void parseArgs(int argc, char **argv) {
-    enum { OptRequestPerm = 1000, OptIdleProbe, OptDrift };
+    enum { OptProbe = 1000 };
     static const struct option longOpts[] = {
-        {"all",                no_argument,       nullptr, 'a'},
-        {"aggressive",         no_argument,       nullptr, 'a'},
-        {"max",                no_argument,       nullptr, 'x'},
-        {"all-rootless",       no_argument,       nullptr, 'x'},
-        {"display",            no_argument,       nullptr, 'd'},
-        {"idle",               required_argument, nullptr, 'i'},
-        {"no-jiggle",          no_argument,       nullptr, 'n'},
-        {"drift",              no_argument,       nullptr, OptDrift},
-        {"hard-no-sleep",      no_argument,       nullptr, 'H'},
-        {"resist-all-sleep",   no_argument,       nullptr, 'H'},
-        {"ac-only",            no_argument,       nullptr, 'A'},
-        {"min-battery",        required_argument, nullptr, 'b'},
-        {"timeout",            required_argument, nullptr, 't'},
-        {"waitpid",            required_argument, nullptr, 'w'},
-        {"idle-probe",         no_argument,       nullptr, OptIdleProbe},
-        {"request-permission", no_argument,       nullptr, OptRequestPerm},
-        {"verbose",            no_argument,       nullptr, 'v'},
-        {"quiet",              no_argument,       nullptr, 'q'},
-        {"version",            no_argument,       nullptr, 'V'},
-        {"help",               no_argument,       nullptr, 'h'},
+        {"rootless",      no_argument,       nullptr, 'x'},
+        {"all",           no_argument,       nullptr, 'a'},
+        {"everything",    no_argument,       nullptr, 'e'},
+        {"display",       no_argument,       nullptr, 'd'},
+        {"strong",        no_argument,       nullptr, 's'},
+        {"presence",      no_argument,       nullptr, 'p'},
+        {"mouse",         no_argument,       nullptr, 'm'},
+        {"hard-no-sleep", no_argument,       nullptr, 'H'},
+        {"no-auto-lock",  no_argument,       nullptr, 'L'},
+        {"idle",          required_argument, nullptr, 'i'},
+        {"timeout",       required_argument, nullptr, 't'},
+        {"waitpid",       required_argument, nullptr, 'w'},
+        {"ac-only",       no_argument,       nullptr, 'A'},
+        {"min-battery",   required_argument, nullptr, 'b'},
+        {"probe",         no_argument,       nullptr, OptProbe},
+        {"verbose",       no_argument,       nullptr, 'v'},
+        {"quiet",         no_argument,       nullptr, 'q'},
+        {"version",       no_argument,       nullptr, 'V'},
+        {"help",          no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
     };
 
+    // Presets are resolved after parsing, so their position on the line does
+    // not matter: -e is -a plus -L, -a is -x plus -H, -x is -d -s -p -m.
+    bool rootless = false, all = false, everything = false, idleGiven = false;
+    int optionsSeen = 0;  // anything but -v/-q, which off/status also accept
     int c;
-    while ((c = getopt_long(argc, argv, "axdnHi:Ab:t:w:vqVh", longOpts,
+    while ((c = getopt_long(argc, argv, "xaedspmHLi:t:w:Ab:vqVh", longOpts,
                             nullptr)) != -1) {
+        if (c != 'v' && c != 'q') optionsSeen++;
         switch (c) {
-        case 'a': cfg.all = true; break;
-        case 'x': cfg.max = true; break;
+        case 'x': rootless = true; break;
+        case 'a': all = true; break;
+        case 'e': everything = true; break;
         case 'd': cfg.display = true; break;
+        case 's': cfg.strong = true; break;
+        case 'p': cfg.presence = true; break;
+        case 'm': cfg.mouse = true; break;
+        case 'H': cfg.hardNoSleep = true; break;
+        case 'L': cfg.lockOverride = true; break;
         case 'A': cfg.acOnly = true; break;
         case 'b': {
             long pct = 0;
@@ -2735,21 +3243,16 @@ static void parseArgs(int argc, char **argv) {
             cfg.minBattery = (int)pct;
             break;
         }
-        case OptIdleProbe: cfg.idleProbe = true; break;
+        case OptProbe: cfg.probe = true; break;
         case 'i':
             cfg.idleThreshold = parseDuration(optarg);
+            idleGiven = true;
             if (cfg.idleThreshold < 5) {
                 fprintf(stderr, "kafueineto: --idle needs a duration from 5s to "
                                 "3650d (for example, 120 or 2m)\n");
                 exit(2);
             }
             break;
-        case 'n':
-            cfg.jiggle = false;
-            cfg.noJiggleExplicit = true;
-            break;
-        case OptDrift: cfg.drift = true; break;
-        case 'H': cfg.hardNoSleep = true; break;
         case 't':
             cfg.timeout = parseDuration(optarg);
             if (cfg.timeout < 1) {
@@ -2774,7 +3277,6 @@ static void parseArgs(int argc, char **argv) {
             cfg.waitPid = (pid_t)pid;
             break;
         }
-        case OptRequestPerm: cfg.requestPerm = true; break;
         case 'v': cfg.verbose++; break;
         case 'q': cfg.quiet = true; break;
         case 'V': printf("kafueineto %s\n", kVersion); exit(0);
@@ -2785,57 +3287,70 @@ static void parseArgs(int argc, char **argv) {
         }
     }
 
+    // One trailing verb at most; getopt has already moved it to the end.
     if (optind < argc) {
-        fprintf(stderr, "kafueineto: unexpected argument '%s'\n", argv[optind]);
-        fprintf(stderr, "Try 'kafueineto --help' for options and examples.\n");
+        const char *verb = argv[optind];
+        bool isVerb = !strcmp(verb, "on") || !strcmp(verb, "off") ||
+                      !strcmp(verb, "status");
+        if (!isVerb || optind + 1 < argc) {
+            fprintf(stderr, "kafueineto: unexpected argument '%s'\n",
+                    isVerb ? argv[optind + 1] : verb);
+            fprintf(stderr, "Try 'kafueineto --help' for options and examples.\n");
+            exit(2);
+        }
+        cfg.command = !strcmp(verb, "on")    ? Command::On
+                      : !strcmp(verb, "off") ? Command::Off
+                                             : Command::Status;
+    }
+    if ((cfg.command == Command::Off || cfg.command == Command::Status) &&
+        optionsSeen > 0) {
+        fprintf(stderr, "kafueineto: '%s' takes no options other than -v or -q\n",
+                cfg.command == Command::Off ? "off" : "status");
+        exit(2);
+    }
+    if (cfg.probe && cfg.command != Command::Run) {
+        fprintf(stderr, "kafueineto: --probe cannot be combined with on, off, "
+                        "or status\n");
         exit(2);
     }
 
-    // Presets resolve top-down: -a is -x plus the root-only layers, and -x is
-    // every layer that needs no privilege.
-    if (cfg.all) {
-        if (cfg.acOnly || cfg.minBattery > 0 || cfg.noJiggleExplicit) {
-            fprintf(stderr,
-                    "kafueineto: -a/--all cannot be combined with --ac-only, "
-                    "--min-battery, or --no-jiggle (use -x for the sudo-free "
-                    "layers with those options)\n");
-            exit(2);
-        }
-        cfg.max = true;
+    if (everything) {
+        all = true;
+        cfg.lockOverride = true;
+    }
+    if (all) {
+        rootless = true;
         cfg.hardNoSleep = true;
-        cfg.jiggle = true;
     }
-    if (cfg.max) {
-        // An explicit --no-jiggle still wins: a preset plus an opt-out is
-        // exactly what the user asked for, and asking for input permission
-        // would then be pointless.
-        cfg.display = true;
-        cfg.strong = true;
-        if (cfg.jiggle) cfg.requestPerm = true;
-    }
-    // Hard mode has always held the strong assertion next to SleepDisabled.
-    if (cfg.hardNoSleep) cfg.strong = true;
+    if (rootless)
+        cfg.display = cfg.strong = cfg.presence = cfg.mouse = true;
 
-    if (cfg.drift && !cfg.jiggle) {
-        fprintf(stderr, "kafueineto: --drift requires mouse input; "
-                        "remove --no-jiggle or --drift\n");
+    if (cfg.lockOverride && (cfg.acOnly || cfg.minBattery > 0)) {
+        fprintf(stderr,
+                "kafueineto: -L/--no-auto-lock (also part of -e) cannot be "
+                "combined with --ac-only or --min-battery; the lock override "
+                "is either on for the whole run or off\n");
         exit(2);
     }
     if (cfg.acOnly && cfg.minBattery > 0)
         fprintf(stderr, "kafueineto: note: --min-battery is redundant with "
                         "--ac-only, which always pauses on battery\n");
-
-    if (cfg.requestPerm && !cfg.jiggle)
-        fprintf(stderr,
-                "kafueineto: note: --request-permission does nothing with "
-                "--no-jiggle\n");
+    if (idleGiven && !cfg.presence && !cfg.mouse)
+        fprintf(stderr, "kafueineto: note: --idle only matters with -p or -m\n");
 }
 
 // ------------------------------------------------------------------ main ---
 
 int main(int argc, char **argv) {
     parseArgs(argc, argv);
-    if (cfg.idleProbe) return idleProbe();
+    if (cfg.probe) return idleProbe();
+    if (cfg.command == Command::Off) return stopDaemons(argc, argv);
+    if (cfg.command == Command::Status) return showDaemons();
+    maybeReexecWithSudo(argc, argv);
+    // `on`: from here on this is the child that becomes the background
+    // instance; the parent is parked inside spawnDaemon until it is ready.
+    int daemonReadyFd = cfg.command == Command::On ? spawnDaemon() : -1;
+    gStartedAt = monotonicMilliseconds();
 
     // A helper child that dies before consuming its pty/pipe input must
     // surface as a write error, never kill this process.
@@ -2857,11 +3372,15 @@ int main(int argc, char **argv) {
     dispatch_suspend(q);
     gMainQueue = q;
 
-    if (cfg.jiggle) {
+    if (cfg.mouse) {
         gEventSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
         if (gEventSource)
             CGEventSourceSetLocalEventsSuppressionInterval(gEventSource, 0.0);
-
+    }
+    if (cfg.presence || cfg.mouse) {
+        // Register with TCC without prompting, then prompt once if the
+        // permission is missing: the user asked for an input method, so the
+        // dialog is expected rather than intrusive.
         CFTypeRef axKeys[] = {kAXTrustedCheckOptionPrompt};
         CFTypeRef axVals[] = {kCFBooleanFalse};
         CFDictionaryRef axOpts = CFDictionaryCreate(
@@ -2871,9 +3390,18 @@ int main(int argc, char **argv) {
             AXIsProcessTrustedWithOptions(axOpts);
             CFRelease(axOpts);
         }
-        if (cfg.requestPerm && !canPostEvents()) {
-            info("requesting Accessibility input-event permission");
+        if (!canPostEvents()) {
+            info("requesting the Accessibility input-event permission for -p/-m");
             CGRequestPostEventAccess();
+        }
+        if (geteuid() == 0) {
+            // Under sudo the presence poke may need the console user's
+            // credentials; remember them for the per-call identity switch.
+            ConsoleUser console;
+            if (getConsoleIdentity(&console)) {
+                gConsoleUid = console.uid;
+                gConsoleGid = console.gid;
+            }
         }
     }
 
@@ -2951,8 +3479,18 @@ int main(int argc, char **argv) {
         dispatch_resume(source);
     }
 
+    // Ctrl-T (SIGINFO) prints a status line without stopping anything. Not
+    // fatal if unavailable: it is a convenience.
+    signal(SIGINFO, SIG_IGN);
+    dispatch_source_t infoSource = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)SIGINFO, 0, q);
+    if (infoSource) {
+        dispatch_source_set_event_handler(infoSource, ^{ printStatus(); });
+        dispatch_resume(infoSource);
+    }
+
     double tickSec;
-    if (cfg.all) {
+    if (cfg.lockOverride) {
         tickSec = 1.0;
     } else {
         tickSec = cfg.idleThreshold / 2.0;
@@ -2962,9 +3500,11 @@ int main(int argc, char **argv) {
     uint64_t tickNs = (uint64_t)(tickSec * NSEC_PER_SEC);
     gTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
     if (!gTimer) shutdownNow("could not create the periodic timer", 1);
+    // 10% leeway in every mode lets the kernel coalesce the timer with other
+    // wakeups; a 1 Hz lock-policy poll does not need millisecond phase.
     dispatch_source_set_timer(gTimer,
                               dispatch_time(DISPATCH_TIME_NOW, (int64_t)tickNs),
-                              tickNs, cfg.all ? 0 : tickNs / 10);
+                              tickNs, tickNs / 10);
     dispatch_source_set_event_handler(gTimer, ^{ tick(); });
     dispatch_resume(gTimer);
 
@@ -2991,20 +3531,38 @@ int main(int argc, char **argv) {
             shutdownNow("watched process already exited", 0);
     }
 
-    info("up: pid %d | %s%s%s%s | jiggle %s "
-         "(idle > %.0fs, tick %.0fs)%s%s",
+    char timed[64] = "";
+    if (gDeadline > 0) {
+        char left[48];
+        snprintf(timed, sizeof timed, " | stops in %s",
+                 formatDuration((gDeadline - monotonicMilliseconds()) / 1000.0,
+                                left, sizeof left));
+    }
+    char presence[96];
+    if (!cfg.presence && !cfg.mouse)
+        snprintf(presence, sizeof presence, "no presence method");
+    else
+        snprintf(presence, sizeof presence,
+                 "%s%s%s %s (after %.0fs idle, tick %.0fs)",
+                 cfg.presence ? "poke" : "",
+                 cfg.presence && cfg.mouse ? "+" : "",
+                 cfg.mouse ? "mouse" : "",
+                 canPostEvents() ? "armed" : "blocked (no permission)",
+                 cfg.idleThreshold, tickSec);
+    info("up: pid %d | %s%s%s%s | %s%s%s%s",
          getpid(),
          gActive ? "system sleep blocked" : "sleep blocking paused",
          gActive && cfg.hardNoSleep ? " | hard no-sleep requested"
          : gActive && cfg.strong    ? " | strong assertion held" : "",
          gActive && cfg.display ? " | display sleep blocked" : "",
-         gActive && cfg.all ? " | automatic Screen Lock disabled" : "",
-         cfg.jiggle ? (canPostEvents() ? "armed" : "blocked (no permission)")
-                    : "off",
-         cfg.idleThreshold, tickSec,
+         gActive && cfg.lockOverride ? " | automatic Screen Lock disabled" : "",
+         presence,
          cfg.acOnly ? " | AC-only" : "",
-         cfg.timeout > 0 ? " | timed" : "");
+         timed,
+         cfg.command != Command::On && isatty(STDOUT_FILENO)
+             ? " | Ctrl-T for status" : "");
 
+    if (daemonReadyFd != -1) finishDaemon(daemonReadyFd, argc, argv);
     dispatch_resume(q);
     dispatch_main();
     return 0;  // dispatch_main() does not return; keeps test builds warning-free.

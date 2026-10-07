@@ -1,0 +1,6 @@
+*
+!.gitignore
+!kafueineto.cpp
+!Makefile
+!README.md
+!test_kafueineto.cpp
